@@ -6,7 +6,7 @@ use ExtUtils::MakeMaker;
 WriteMakefile(
    NAME  => 'IPC::Cache',
    VERSION_FROM => 'Cache.pm',
-   PREREQ_PM => { IPC::Shareable => '0.30', Storable => '0.607' },
+   PREREQ_PM => { IPC::ShareLite => '0.06', Storable => '0.607' },
    dist =>  {COMPRESS => 'gzip', SUFFIX => '.gz'}
 );
 

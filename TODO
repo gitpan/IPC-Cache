@@ -5,11 +5,6 @@ Short term
 
 Long term
 
-- consider using an alternate shared memory backend, instead of
-  IPC::Shareable.  IPC::Shareable is super convenient and well written, 
-  but it deals with hashes and references and calls Storable itself, which
-  is somewhat redundant and most of that functionality isn't used
-
 - figure out a good mechanism for automatically and periodically 
   purging the cache of expired objects
 

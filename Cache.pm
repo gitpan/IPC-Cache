@@ -4,12 +4,12 @@ package IPC::Cache;
 
 use strict;
 use Carp;
-use IPC::Shareable;
+use IPC::ShareLite;
 use Storable qw(freeze thaw dclone);
 use vars qw($VERSION);
+use Fcntl ':flock';
 
-
-$VERSION = '0.01';
+$VERSION = '0.02';
 
 my $sEXPIRES_NOW = 0;
 my $sEXPIRES_NEVER = -1;
@@ -18,7 +18,7 @@ my $sTRUE = 1;
 my $sFALSE = 0;
 
 
-# IPC::Shareable converts a four character text string to the shared memory key
+# IPC::ShareLite converts a four character text string to the shared memory key
 
 my $sDEFAULT_CACHE_KEY = "IPCC";
 
@@ -51,21 +51,28 @@ sub new
 
     $self->{_expires_in} = $options->{expires_in} || $sEXPIRES_NEVER;
 
-    # tie the scalar $self->{_frozen_data} to a shared memory segment(s) under the name specified or the default
+    # create a new share associated with the cache key
 
     my $cache_key = $options->{cache_key} || $sDEFAULT_CACHE_KEY;
 
-    tie($self->{_frozen_data}, 'IPC::Shareable', { key => $cache_key, create => 1}) or
-	croak("Couldn't tie IPC::Shareable: $!");
+    my $share = new IPC::ShareLite( -key => $cache_key, -create => 1  ) or
+	croak("Couldn't create new IPC::ShareLite");
+
+    # store the share for this instance
+
+    $self->{_share} = $share;
 
     
     # atomically initialize the segment as frozen data
 
     $self->_lock();
-    
-    if (not $self->{_frozen_data}) {
+
+    my $frozen_data = $self->_get_frozen_data();
+
+    if (not $frozen_data) {
 	my %data;
-	$self->{_frozen_data} = freeze(\%data);
+	$frozen_data = freeze(\%data);
+	$self->_set_frozen_data($frozen_data);
     }
 
     $self->_unlock();
@@ -106,11 +113,15 @@ sub set
 
     $self->_lock();
 
-    my %data = %{ thaw($self->{_frozen_data}) };
+    my $frozen_data = $self->_get_frozen_data();
+
+    my %data = %{ thaw($frozen_data) };
 
     $data{$namespace}->{$identifier} = { object => $object, expires_at => $expires_at };
 
-    $self->{_frozen_data} = freeze(\%data);
+    $frozen_data = freeze(\%data);
+
+    $self->_set_frozen_data($frozen_data);
 
     $self->_unlock();
 
@@ -137,7 +148,9 @@ sub get
 
     $self->_lock();
 
-    my %data = %{ thaw($self->{_frozen_data}) };
+    my $frozen_data = $self->_get_frozen_data();
+    
+    my %data = %{ thaw($frozen_data) };
 
     if (exists $data{$namespace}->{$identifier}) {
 
@@ -173,13 +186,17 @@ sub clear
 
     $self->_lock();
 
-    my %data = %{ thaw($self->{_frozen_data}) };
+    my $frozen_data = $self->_get_frozen_data();
+    
+    my %data = %{ thaw($frozen_data) };
 
     foreach my $identifier (keys %{$data{$namespace}}) {
 	delete $data{$namespace}->{$identifier};
     }
 
-    $self->{_frozen_data} = freeze(\%data);
+    $frozen_data = freeze(\%data);
+
+    $self->_set_frozen_data($frozen_data);
 
     $self->_unlock();
 
@@ -202,13 +219,17 @@ sub purge
 
     $self->_lock();
 
-    my %data = %{ thaw($self->{_frozen_data}) };
+    my $frozen_data = $self->_get_frozen_data();
+    
+    my %data = %{ thaw($frozen_data) };
 
     my $namespace_ref = $data{$namespace};
 
     _s_purge_namespace($namespace_ref, $time);
 
-    $self->{_frozen_data} = freeze(\%data);
+    $frozen_data = freeze(\%data);
+    
+    $self->_set_frozen_data($frozen_data);
 
     $self->_unlock();
 
@@ -229,8 +250,10 @@ sub _purge_all
 
     $self->_lock();
 
-    my %data = %{ thaw($self->{_frozen_data}) };
+    my $frozen_data = $self->_get_frozen_data();
 
+    my %data = %{ thaw($frozen_data) };
+    
     foreach my $namespace (keys %data) {
 
 	my $namespace_ref = $data{$namespace};
@@ -239,7 +262,9 @@ sub _purge_all
 
     }
 
-    $self->{_frozen_data} = freeze(\%data);
+    $frozen_data = freeze(\%data);
+
+    $self->_set_frozen_data($frozen_data);
 
     $self->_unlock();
 
@@ -298,11 +323,40 @@ sub _size
 
     $self->_lock();
 
-    my $size = length $self->{_frozen_data};
+    my $frozen_data = $self->_get_frozen_data();
+
+    my $size = length $frozen_data;
 
     $self->_unlock();
 
     return $size;
+}
+
+# set the frozen data in the share
+
+sub _set_frozen_data
+{
+    my ($self, $frozen_data) = @_;
+
+    my $share = $self->{_share} or
+	croak("Couldn't get share");
+
+    $share->store($frozen_data);
+
+    return $sSUCCESS;
+}
+
+
+# get the frozen data from the share 
+
+sub _get_frozen_data 
+{
+    my ($self) = @_;
+
+    my $share = $self->{_share} or
+	croak("Couldn't get share");
+
+    return $share->fetch();
 }
 
 
@@ -311,7 +365,14 @@ sub _size
 sub _lock  
 {
     my ($self) = @_;
-    (tied $self->{_frozen_data})->shlock();
+
+    my $share = $self->{_share} or
+	croak("Couldn't get share");
+
+    $share->lock(LOCK_EX) or
+	croak("Couldn't lock");
+
+    return $sSUCCESS;
 }
 
 
@@ -320,7 +381,14 @@ sub _lock
 sub _unlock 
 {
     my ($self) = @_;
-    (tied $self->{_frozen_data})->shunlock();
+
+    my $share = $self->{_share} or
+	croak("Couldn't get share");
+
+    $share->unlock() or
+	croak("Couldn't unlock");
+
+    return $sSUCCESS;
 }
 
 
@@ -333,8 +401,8 @@ sub CLEAR
 
     $cache_key = $cache_key || $sDEFAULT_CACHE_KEY;
 
-    tie(my $tmp, 'IPC::Shareable', { key => $cache_key, create => 1, destroy => 1 }) or
-	croak("Couldn't tie IPC::Shareable: $!");
+    my $tmp_share = new IPC::ShareLite( -key => $cache_key, -create => 1, -destroy => 1 ) or
+	croak("Couldn't create new IPC::ShareLite");
 
     return $sSUCCESS;
 }
@@ -573,10 +641,6 @@ The SIZE method estimates only the size of the frozen data, not the actual share
 =item *
 
 There is no mechanism for limiting the amount of memory in use
-
-=item *
-
-The reliance on IPC::Shareable may incur an unnecessary overhead
 
 =back
 
